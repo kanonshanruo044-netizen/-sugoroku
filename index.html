@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>夢女子すごろく ONLINE</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <h1>夢女子すごろく ONLINE</h1>
+      <p>推しと進め。友達と沼れ。</p>
+    </header>
+
+    <main>
+      <section id="homeScreen" class="card">
+        <h2>はじめる</h2>
+
+        <label>
+          あなたの名前
+          <input id="playerNameInput" type="text" placeholder="例：あなたの名前" maxlength="12" />
+        </label>
+
+        <label>
+          推しの名前
+          <input id="oshiNameInput" type="text" placeholder="例：推しの名前" maxlength="12" />
+        </label>
+
+        <button id="createRoomButton">部屋を作る</button>
+
+        <hr />
+
+        <label>
+          部屋ID
+          <input id="roomIdInput" type="text" placeholder="例：ABC123" maxlength="8" />
+        </label>
+
+        <button id="joinRoomButton">部屋に入る</button>
+
+        <p id="homeMessage" class="message"></p>
+      </section>
+
+      <section id="roomScreen" class="card hidden">
+        <p class="small">部屋ID</p>
+        <h2 id="roomIdText">------</h2>
+
+        <button id="copyRoomButton">部屋IDコピー</button>
+
+        <h3>参加者</h3>
+        <ul id="playerList"></ul>
+
+        <button id="startGameButton">ゲーム開始</button>
+        <p id="roomMessage" class="message"></p>
+      </section>
+
+      <section id="gameScreen" class="hidden">
+        <div class="card">
+          <p>部屋ID：<span id="gameRoomIdText">------</span></p>
+          <p>現在の番：<span id="turnPlayerText">---</span></p>
+        </div>
+
+        <div class="card">
+          <div id="board" class="board"></div>
+        </div>
+
+        <div class="card center">
+          <div id="diceResult" class="dice">🎲</div>
+          <button id="rollDiceButton">サイコロを振る</button>
+          <p id="eventText" class="eventText">ゲーム開始を待っています。</p>
+          <p id="gameMessage" class="message"></p>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script type="module" src="./game.js"></script>
+</body>
+</html>
