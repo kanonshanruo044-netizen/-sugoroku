@@ -4,18 +4,13 @@ import {
   set,
   get,
   update,
+  remove,
   onValue,
   off,
   runTransaction
 } from "./firebase.js";
 
-/* =========================================================
-   夢女子すごろく ONLINE
-   - Firebase Realtime Database 版
-   - 最大5人 / 部屋ID / 順番制 / 同時操作対策
-   ========================================================= */
-
-const MAX_PLAYERS = 5;
+const HARD_MAX_PLAYERS = 5;
 const GOAL = 24;
 const ROOM_ID_LENGTH = 6;
 const ROOM_ID_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -58,7 +53,6 @@ const state = {
   roomId: "",
   playerId: "",
   room: null,
-  unsubscribeRoom: null,
   isRolling: false
 };
 
@@ -68,11 +62,10 @@ const ui = {
   homeScreen: $("homeScreen"),
   roomScreen: $("roomScreen"),
   gameScreen: $("gameScreen"),
-
   playerNameInput: $("playerNameInput"),
   oshiNameInput: $("oshiNameInput"),
+  maxPlayersInput: $("maxPlayersInput"),
   roomIdInput: $("roomIdInput"),
-
   createRoomButton: $("createRoomButton"),
   joinRoomButton: $("joinRoomButton"),
   copyRoomButton: $("copyRoomButton"),
@@ -80,13 +73,12 @@ const ui = {
   startGameButton: $("startGameButton"),
   rollDiceButton: $("rollDiceButton"),
   replayButton: $("replayButton"),
-
   homeMessage: $("homeMessage"),
   roomMessage: $("roomMessage"),
   gameMessage: $("gameMessage"),
-
   roomIdText: $("roomIdText"),
   gameRoomIdText: $("gameRoomIdText"),
+  capacityText: $("capacityText"),
   playerList: $("playerList"),
   board: $("board"),
   diceResult: $("diceResult"),
@@ -96,6 +88,8 @@ const ui = {
   resultPanel: $("resultPanel"),
   resultText: $("resultText")
 };
+
+let activeRoomRef = null;
 
 init();
 
@@ -109,35 +103,23 @@ function bindEvents() {
   ui.createRoomButton.addEventListener("click", createRoom);
   ui.joinRoomButton.addEventListener("click", joinRoom);
   ui.copyRoomButton.addEventListener("click", copyRoomId);
-  ui.leaveRoomButton.addEventListener("click", leaveRoom);
+  ui.leaveRoomButton.addEventListener("click", () => leaveRoom(true));
   ui.startGameButton.addEventListener("click", startGame);
   ui.rollDiceButton.addEventListener("click", rollDice);
   ui.replayButton.addEventListener("click", replayGame);
-
   ui.roomIdInput.addEventListener("input", () => {
     ui.roomIdInput.value = normaliseRoomId(ui.roomIdInput.value);
-  });
-
-  [ui.playerNameInput, ui.oshiNameInput, ui.roomIdInput].forEach((input) => {
-    input.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") {
-        if (ui.roomIdInput.value.trim()) joinRoom();
-        else createRoom();
-      }
-    });
   });
 }
 
 async function restoreLastRoom() {
   const savedRoomId = sessionStorage.getItem(ROOM_ID_KEY);
   const savedPlayerId = sessionStorage.getItem(PLAYER_ID_KEY);
-
   if (!savedRoomId || !savedPlayerId) return;
 
-  const roomSnapshot = await get(ref(database, `rooms/${savedRoomId}`));
-  const savedRoom = roomSnapshot.val();
-
-  if (!savedRoom || !savedRoom.players?.[savedPlayerId]) {
+  const snapshot = await get(ref(database, `rooms/${savedRoomId}`));
+  const room = snapshot.val();
+  if (!room || !room.players?.[savedPlayerId]) {
     clearSavedSession();
     return;
   }
@@ -151,6 +133,7 @@ async function createRoom() {
   const player = readPlayerInputs();
   if (!player) return;
 
+  const maxPlayers = clampMaxPlayers(Number(ui.maxPlayersInput.value));
   setHomeMessage("部屋を作成中です…");
   setButtonLoading(ui.createRoomButton, true, "作成中…");
 
@@ -162,27 +145,23 @@ async function createRoom() {
       const candidate = makeRoomId();
       const result = await runTransaction(ref(database, `rooms/${candidate}`), (current) => {
         if (current !== null) return;
-
-        return makeNewRoom(candidate, playerId, player);
+        return makeNewRoom(candidate, playerId, player, maxPlayers);
       });
-
       if (result.committed) {
         createdRoomId = candidate;
         break;
       }
     }
 
-    if (!createdRoomId) {
-      throw new Error("部屋IDの作成に失敗しました。もう一度試してください。");
-    }
+    if (!createdRoomId) throw new Error("部屋IDの作成に失敗しました。もう一度試してください。");
 
     state.roomId = createdRoomId;
     state.playerId = playerId;
     saveSession();
     openRoom(createdRoomId);
   } catch (error) {
-    console.error("createRoom error", error);
-    setHomeMessage(toFriendlyError(error));
+    console.error(error);
+    setHomeMessage(toFriendlyError(error), true);
   } finally {
     setButtonLoading(ui.createRoomButton, false);
   }
@@ -210,14 +189,13 @@ async function joinRoom() {
         reason = "notFound";
         return;
       }
-
       if (room.status !== "waiting") {
         reason = "alreadyStarted";
         return;
       }
-
       const order = Array.isArray(room.playerOrder) ? room.playerOrder : [];
-      if (order.length >= MAX_PLAYERS) {
+      const maxPlayers = clampMaxPlayers(room.maxPlayers || HARD_MAX_PLAYERS);
+      if (order.length >= maxPlayers) {
         reason = "full";
         return;
       }
@@ -239,7 +217,7 @@ async function joinRoom() {
     if (!result.committed) {
       if (reason === "notFound") throw new Error("その部屋は見つかりません。");
       if (reason === "alreadyStarted") throw new Error("この部屋はすでにゲームを開始しています。");
-      if (reason === "full") throw new Error("この部屋は満員です（最大5人）。");
+      if (reason === "full") throw new Error("この部屋は満員です。");
       throw new Error("部屋に参加できませんでした。もう一度試してください。");
     }
 
@@ -248,74 +226,58 @@ async function joinRoom() {
     saveSession();
     openRoom(targetRoomId);
   } catch (error) {
-    console.error("joinRoom error", error);
-    setHomeMessage(toFriendlyError(error));
+    console.error(error);
+    setHomeMessage(toFriendlyError(error), true);
   } finally {
     setButtonLoading(ui.joinRoomButton, false);
   }
 }
 
 function openRoom(roomId) {
-  if (state.unsubscribeRoom) {
-    off(ref(database, `rooms/${state.roomId}`));
-  }
+  if (activeRoomRef) off(activeRoomRef);
 
   state.roomId = roomId;
   ui.roomIdText.textContent = roomId;
   ui.gameRoomIdText.textContent = roomId;
 
-  const roomRef = ref(database, `rooms/${roomId}`);
-  state.unsubscribeRoom = onValue(
-    roomRef,
-    (snapshot) => {
-      const room = snapshot.val();
-
-      if (!room) {
-        setRoomMessage("この部屋はなくなりました。", true);
-        leaveRoom(false);
-        return;
-      }
-
-      state.room = room;
-      renderRoomState(room);
-    },
-    (error) => {
-      console.error("room listener error", error);
-      setRoomMessage(toFriendlyError(error), true);
+  activeRoomRef = ref(database, `rooms/${roomId}`);
+  onValue(activeRoomRef, (snapshot) => {
+    const room = snapshot.val();
+    if (!room) {
+      setRoomMessage("この部屋はなくなりました。", true);
+      leaveRoom(false);
+      return;
     }
-  );
+    state.room = room;
+    renderRoomState(room);
+  }, (error) => {
+    console.error(error);
+    setRoomMessage(toFriendlyError(error), true);
+  });
 }
 
 function renderRoomState(room) {
-  const status = room.status || "waiting";
-
-  if (status === "waiting") {
+  if ((room.status || "waiting") === "waiting") {
     showScreen("room");
     renderLobby(room);
-    return;
+  } else {
+    showScreen("game");
+    renderGame(room);
   }
-
-  showScreen("game");
-  renderGame(room);
 }
 
 function renderLobby(room) {
   const players = getOrderedPlayers(room);
+  const maxPlayers = clampMaxPlayers(room.maxPlayers || HARD_MAX_PLAYERS);
   const isHost = room.hostId === state.playerId;
 
+  ui.capacityText.textContent = `${maxPlayers}人部屋：参加者 ${players.length} / ${maxPlayers}人`;
   ui.playerList.innerHTML = "";
 
   players.forEach((player, index) => {
     const li = document.createElement("li");
     li.className = "playerItem";
-
-    const name = document.createElement("strong");
-    name.textContent = `${index + 1}. ${player.name}${player.id === room.hostId ? "（部屋主）" : ""}`;
-
-    const oshi = document.createElement("span");
-    oshi.textContent = `推し：${player.oshi}`;
-
-    li.append(name, oshi);
+    li.innerHTML = `<strong>${index + 1}. ${escapeHtml(player.name)}${player.id === room.hostId ? "（部屋主）" : ""}</strong><span>推し：${escapeHtml(player.oshi)}</span>`;
     ui.playerList.appendChild(li);
   });
 
@@ -324,8 +286,8 @@ function renderLobby(room) {
 
   setRoomMessage(
     isHost
-      ? `参加者 ${players.length} / ${MAX_PLAYERS}人。準備できたら開始してください。`
-      : `参加者 ${players.length} / ${MAX_PLAYERS}人。部屋主が開始するまで待ってください。`
+      ? `この部屋は${maxPlayers}人まで。準備できたら開始してください。`
+      : "部屋主が開始するまで待ってください。"
   );
 }
 
@@ -336,14 +298,11 @@ async function startGame() {
   }
 
   setButtonLoading(ui.startGameButton, true, "開始中…");
-
   try {
     const result = await runTransaction(ref(database, `rooms/${state.roomId}`), (room) => {
       if (!room || room.hostId !== state.playerId || room.status !== "waiting") return;
-
       const playerOrder = Array.isArray(room.playerOrder) ? room.playerOrder : [];
       if (playerOrder.length === 0) return;
-
       room.status = "playing";
       room.turnIndex = 0;
       room.lastDice = null;
@@ -352,12 +311,9 @@ async function startGame() {
       room.updatedAt = Date.now();
       return room;
     });
-
-    if (!result.committed) {
-      throw new Error("ゲームを開始できませんでした。画面を更新して確認してください。");
-    }
+    if (!result.committed) throw new Error("ゲームを開始できませんでした。");
   } catch (error) {
-    console.error("startGame error", error);
+    console.error(error);
     setRoomMessage(toFriendlyError(error), true);
   } finally {
     setButtonLoading(ui.startGameButton, false);
@@ -375,7 +331,6 @@ function renderGame(room) {
   ui.courseNameText.textContent = room.courseName || COURSE.name;
   ui.diceResult.textContent = room.lastDice ? diceFace(room.lastDice) : "🎲";
   ui.eventText.textContent = room.lastEvent || "ゲーム開始！";
-
   ui.rollDiceButton.disabled = !isMyTurn || state.isRolling;
   ui.rollDiceButton.textContent = state.isRolling ? "サイコロを振っています…" : "サイコロを振る";
 
@@ -397,7 +352,6 @@ async function rollDice() {
 
   const players = getOrderedPlayers(state.room);
   const currentPlayer = players[normaliseTurnIndex(state.room.turnIndex, players.length)];
-
   if (state.room.status !== "playing" || currentPlayer?.id !== state.playerId) {
     setGameMessage("まだあなたの番ではありません。", true);
     return;
@@ -411,37 +365,29 @@ async function rollDice() {
   try {
     const rolledDice = await animateDice();
     let failureMessage = "";
-
     const result = await runTransaction(ref(database, `rooms/${state.roomId}`), (room) => {
       if (!room || room.status !== "playing") {
         failureMessage = "ゲームはすでに終了しています。";
         return;
       }
-
       const order = Array.isArray(room.playerOrder) ? room.playerOrder : [];
       const turnIndex = normaliseTurnIndex(room.turnIndex, order.length);
       const currentPlayerId = order[turnIndex];
-
       if (currentPlayerId !== state.playerId) {
         failureMessage = "ほかの人の番になっています。";
         return;
       }
-
       const player = room.players?.[state.playerId];
       if (!player) {
         failureMessage = "プレイヤー情報が見つかりません。";
         return;
       }
-
       const oldPosition = Number(player.position) || 0;
       const newPosition = Math.min(oldPosition + rolledDice, GOAL);
-      const event = makeEventText(newPosition, player);
-
       player.position = newPosition;
       room.lastDice = rolledDice;
-      room.lastEvent = `${player.name}が${rolledDice}を出した！ ${event}`;
+      room.lastEvent = `${player.name}が${rolledDice}を出した！ ${makeEventText(newPosition, player)}`;
       room.updatedAt = Date.now();
-
       if (newPosition >= GOAL) {
         room.status = "finished";
         room.winnerId = state.playerId;
@@ -449,15 +395,11 @@ async function rollDice() {
       } else {
         room.turnIndex = (turnIndex + 1) % order.length;
       }
-
       return room;
     });
-
-    if (!result.committed) {
-      throw new Error(failureMessage || "サイコロの結果を反映できませんでした。");
-    }
+    if (!result.committed) throw new Error(failureMessage || "サイコロの結果を反映できませんでした。");
   } catch (error) {
-    console.error("rollDice error", error);
+    console.error(error);
     setGameMessage(toFriendlyError(error), true);
   } finally {
     state.isRolling = false;
@@ -468,16 +410,13 @@ async function rollDice() {
 
 async function replayGame() {
   if (!state.room || state.room.hostId !== state.playerId) return;
-
   try {
     const result = await runTransaction(ref(database, `rooms/${state.roomId}`), (room) => {
       if (!room || room.hostId !== state.playerId || room.status !== "finished") return;
-
       const order = Array.isArray(room.playerOrder) ? room.playerOrder : [];
       order.forEach((id) => {
         if (room.players?.[id]) room.players[id].position = 0;
       });
-
       room.status = "playing";
       room.turnIndex = 0;
       room.lastDice = null;
@@ -486,72 +425,55 @@ async function replayGame() {
       room.updatedAt = Date.now();
       return room;
     });
-
     if (!result.committed) throw new Error("再戦を開始できませんでした。");
   } catch (error) {
-    console.error("replayGame error", error);
+    console.error(error);
     setGameMessage(toFriendlyError(error), true);
   }
 }
 
 async function copyRoomId() {
-  if (!state.roomId) return;
-
   try {
     await navigator.clipboard.writeText(state.roomId);
-    setRoomMessage("部屋IDをコピーしました。友達に送ってください。", false);
+    setRoomMessage("部屋IDをコピーしました。友達に送ってください。");
   } catch {
-    setRoomMessage(`部屋ID：${state.roomId}`, false);
+    setRoomMessage(`部屋ID：${state.roomId}`);
   }
 }
 
 async function leaveRoom(removePlayer = true) {
   const leavingRoomId = state.roomId;
   const leavingPlayerId = state.playerId;
-
-  if (state.unsubscribeRoom && leavingRoomId) {
-    off(ref(database, `rooms/${leavingRoomId}`));
-  }
-
+  if (activeRoomRef) off(activeRoomRef);
+  activeRoomRef = null;
   state.roomId = "";
   state.playerId = "";
   state.room = null;
-  state.unsubscribeRoom = null;
   clearSavedSession();
   showScreen("home");
-
   if (!removePlayer || !leavingRoomId || !leavingPlayerId) return;
 
   try {
     await runTransaction(ref(database, `rooms/${leavingRoomId}`), (room) => {
       if (!room || room.status !== "waiting" || !room.players?.[leavingPlayerId]) return room;
-
       const order = (room.playerOrder || []).filter((id) => id !== leavingPlayerId);
       delete room.players[leavingPlayerId];
       room.playerOrder = order;
       room.updatedAt = Date.now();
-
-      if (room.hostId === leavingPlayerId && order.length > 0) {
-        room.hostId = order[0];
-        room.lastEvent = "部屋主が退出したため、部屋主が引き継がれました。";
-      }
-
+      if (room.hostId === leavingPlayerId && order.length > 0) room.hostId = order[0];
       if (order.length === 0) return null;
       return room;
     });
   } catch (error) {
-    console.warn("leaveRoom cleanup error", error);
+    console.warn(error);
   }
 }
 
 function createBoard() {
   ui.board.innerHTML = "";
-
   for (let position = 0; position <= GOAL; position += 1) {
     const cell = document.createElement("div");
     cell.className = "cell";
-    cell.dataset.position = String(position);
-
     if (position === 0) cell.classList.add("start");
     if (position === GOAL) cell.classList.add("goal");
 
@@ -570,30 +492,26 @@ function createBoard() {
 
 function renderPieces(room) {
   for (let position = 0; position <= GOAL; position += 1) {
-    const box = $("pieces-" + position);
+    const box = $(`pieces-${position}`);
     if (box) box.innerHTML = "";
   }
-
   getOrderedPlayers(room).forEach((player, index) => {
     const position = Math.max(0, Math.min(Number(player.position) || 0, GOAL));
-    const box = $("pieces-" + position);
+    const box = $(`pieces-${position}`);
     if (!box) return;
-
     const piece = document.createElement("span");
     piece.className = `piece piece${index}`;
-    piece.title = `${player.name} ／ 推し：${player.oshi}`;
-    piece.setAttribute("aria-label", `${player.name}のコマ`);
     piece.textContent = player.name.slice(0, 1);
-
     if (player.id === state.playerId) piece.classList.add("me");
     box.appendChild(piece);
   });
 }
 
-function makeNewRoom(roomId, playerId, player) {
+function makeNewRoom(roomId, playerId, player, maxPlayers) {
   return {
     roomId,
     hostId: playerId,
+    maxPlayers,
     status: "waiting",
     courseId: COURSE.id,
     courseName: COURSE.name,
@@ -619,12 +537,10 @@ function makeNewRoom(roomId, playerId, player) {
 function readPlayerInputs() {
   const name = cleanName(ui.playerNameInput.value);
   const oshi = cleanName(ui.oshiNameInput.value);
-
   if (!name || !oshi) {
     setHomeMessage("あなたの名前と推しの名前を入れてください。", true);
     return null;
   }
-
   return { name, oshi };
 }
 
@@ -653,12 +569,10 @@ function diceFace(value) {
 async function animateDice() {
   const duration = 700;
   const startedAt = performance.now();
-
   return new Promise((resolve) => {
     const timer = window.setInterval(() => {
       const preview = Math.floor(Math.random() * 6) + 1;
       ui.diceResult.textContent = diceFace(preview);
-
       if (performance.now() - startedAt >= duration) {
         window.clearInterval(timer);
         const finalValue = Math.floor(Math.random() * 6) + 1;
@@ -673,25 +587,20 @@ function playDiceSound() {
   try {
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     if (!AudioContextClass) return;
-
     const context = new AudioContextClass();
     const oscillator = context.createOscillator();
     const gain = context.createGain();
-
     oscillator.type = "triangle";
     oscillator.frequency.setValueAtTime(180, context.currentTime);
     oscillator.frequency.exponentialRampToValueAtTime(90, context.currentTime + 0.12);
     gain.gain.setValueAtTime(0.06, context.currentTime);
     gain.gain.exponentialRampToValueAtTime(0.001, context.currentTime + 0.14);
-
     oscillator.connect(gain);
     gain.connect(context.destination);
     oscillator.start();
     oscillator.stop(context.currentTime + 0.15);
     oscillator.addEventListener("ended", () => context.close());
-  } catch {
-    // 音が出せない端末でもゲーム自体は続ける。
-  }
+  } catch {}
 }
 
 function showScreen(name) {
@@ -700,17 +609,9 @@ function showScreen(name) {
   ui.gameScreen.classList.toggle("hidden", name !== "game");
 }
 
-function setHomeMessage(text, isError = false) {
-  setMessage(ui.homeMessage, text, isError);
-}
-
-function setRoomMessage(text, isError = false) {
-  setMessage(ui.roomMessage, text, isError);
-}
-
-function setGameMessage(text, isError = false) {
-  setMessage(ui.gameMessage, text, isError);
-}
+function setHomeMessage(text, isError = false) { setMessage(ui.homeMessage, text, isError); }
+function setRoomMessage(text, isError = false) { setMessage(ui.roomMessage, text, isError); }
+function setGameMessage(text, isError = false) { setMessage(ui.gameMessage, text, isError); }
 
 function setMessage(element, text, isError) {
   element.textContent = text;
@@ -729,18 +630,11 @@ function setButtonLoading(button, isLoading, loadingText = "") {
 }
 
 function cleanName(value) {
-  return String(value || "")
-    .trim()
-    .replace(/\s+/g, " ")
-    .replace(/[.#$\[\]/]/g, "")
-    .slice(0, 12);
+  return String(value || "").trim().replace(/\s+/g, " ").replace(/[.#$\[\]/]/g, "").slice(0, 12);
 }
 
 function normaliseRoomId(value) {
-  return String(value || "")
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, "")
-    .slice(0, ROOM_ID_LENGTH);
+  return String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, ROOM_ID_LENGTH);
 }
 
 function makeRoomId() {
@@ -755,6 +649,10 @@ function makePlayerId() {
   return `player_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function clampMaxPlayers(value) {
+  return Math.max(1, Math.min(HARD_MAX_PLAYERS, Number(value) || 2));
+}
+
 function saveSession() {
   sessionStorage.setItem(ROOM_ID_KEY, state.roomId);
   sessionStorage.setItem(PLAYER_ID_KEY, state.playerId);
@@ -767,14 +665,11 @@ function clearSavedSession() {
 
 function toFriendlyError(error) {
   const message = error?.message || "不明なエラーが発生しました。";
-
-  if (message.includes("PERMISSION_DENIED")) {
-    return "Firebaseのルールで拒否されました。Realtime Databaseのルールを確認してください。";
-  }
-
-  if (message.includes("network") || message.includes("Network")) {
-    return "通信に失敗しました。電波のよい場所で、もう一度試してください。";
-  }
-
+  if (message.includes("PERMISSION_DENIED")) return "Firebaseのルールで拒否されました。Realtime Databaseのルールを確認してください。";
+  if (message.includes("network") || message.includes("Network")) return "通信に失敗しました。電波のよい場所で、もう一度試してください。";
   return message;
+}
+
+function escapeHtml(value) {
+  return String(value || "").replace(/[&<>"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[char]));
 }
