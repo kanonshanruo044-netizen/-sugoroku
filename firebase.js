@@ -1,8 +1,6 @@
-// firebase.js
 // 夢女子すごろく ONLINE 用 Firebase設定ファイル
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
-
 import {
   getDatabase,
   ref,
@@ -37,5 +35,5 @@ export {
   remove,
   onValue,
   off,
- runTransaction
+  runTransaction
 };
